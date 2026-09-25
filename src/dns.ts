@@ -1,6 +1,6 @@
 import dns from "node:dns/promises";
-import { config } from "./config.js";
-import type { MxResult } from "./types.js";
+import { config } from "./config.ts";
+import type { MxResult } from "./types.ts";
 
 interface CacheEntry {
   value: MxResult;

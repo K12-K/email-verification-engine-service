@@ -1,5 +1,5 @@
 import { Redis as IORedis } from "ioredis";
-import { config } from "./config.js";
+import { config } from "./config.ts";
 
 export const redis = new IORedis(config.REDIS_URL, {
   maxRetriesPerRequest: null,

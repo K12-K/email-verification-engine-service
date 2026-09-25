@@ -3,13 +3,13 @@ import {
   Job
 } from "bullmq";
 
-import { redis } from "./redis.js";
-import { config } from "./config.js";
-import { db } from "./db.js";
-import { verifyEmail } from "./verifier.js";
+import { redis } from "./redis.ts";
+import { config } from "./config.ts";
+import { db } from "./db.ts";
+import { verifyEmail } from "./verifier.ts";
 import type {
   VerificationJobPayload
-} from "./types.js";
+} from "./types.ts";
 
 async function processJob(
   job: Job<VerificationJobPayload>

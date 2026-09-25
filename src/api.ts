@@ -1,9 +1,9 @@
 import express from "express";
 import { z } from "zod";
 
-import { config } from "./config.js";
-import { db } from "./db.js";
-import { verificationQueue } from "./queue.js";
+import { config } from "./config.ts";
+import { db } from "./db.ts";
+import { verificationQueue } from "./queue.ts";
 
 const app = express();
 
@@ -44,8 +44,8 @@ app.get(
         status: "ok"
       });
 
-    } catch {
-
+    } catch (err) {
+      console.log(err)
       res.status(503).json({
         status: "unhealthy"
       });

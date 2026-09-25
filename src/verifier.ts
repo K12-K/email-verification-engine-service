@@ -2,12 +2,12 @@ import { getHostname } from "tldts";
 import type {
   Confidence,
   VerificationResult
-} from "./types.js";
+} from "./types.ts";
 import crypto from "node:crypto";
-import { resolveMx } from "./dns.js";
-import { smtpVerify } from "./smtp.js";
-import type { MxResult } from "./types.js";
-import { config } from "./config.js";
+import { resolveMx } from "./dns.ts";
+import { smtpVerify } from "./smtp.ts";
+import type { MxResult } from "./types.ts";
+import { config } from "./config.ts";
 
 export interface ParsedEmail {
   email: string;

@@ -1,9 +1,9 @@
 import { SMTPClient } from "smtp-client";
-import { config } from "./config.js";
+import { config } from "./config.ts";
 import type {
   MxRecord,
   SmtpResult
-} from "./types.js";
+} from "./types.ts";
 
 function timeout<T>(
   promise: Promise<T>,
