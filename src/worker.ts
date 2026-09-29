@@ -3,8 +3,9 @@ import { redis } from "./redis.ts";
 import { config } from "./config.ts";
 import { db } from "./db.ts";
 import { verifyEmail } from "./verifier.ts";
-import { resolveMx } from "./dns.js";
-import { startOutboxDispatcher } from "./outbox.js";
+import { resolveMx } from "./dns.ts";
+import { startOutboxDispatcher } from "./outbox.ts";
+import { logger } from "./logger.ts";
 import type {
   VerificationJobPayload,
   VerificationResult
@@ -167,6 +168,7 @@ async function processJob(job: Job<VerificationJobPayload>) {
   );
 
   let processed = 0;
+  let cancelled = false;
 
   const counters = {
     deliverable: 0,
@@ -189,6 +191,8 @@ async function processJob(job: Job<VerificationJobPayload>) {
     while (true) {
       const current = index++;
       if (current >= emails.length) return;
+
+      if (cancelled) return;
 
       const row = emails[current];
       // const verification = await verifyEmail(row.email);
@@ -234,6 +238,16 @@ async function processJob(job: Job<VerificationJobPayload>) {
           percentage
         });
 
+        const statusCheck = await db.query<{ status: string }>(
+          `select status from verification_jobs where id = $1`,
+          [jobId]
+        );
+
+        if (statusCheck.rows[0]?.status === "cancelled") {
+          cancelled = true;
+          return;
+        }
+
         await db.query(
           `
             update verification_jobs
@@ -274,6 +288,34 @@ async function processJob(job: Job<VerificationJobPayload>) {
   if (batch.length) {
     const chunk = batch.splice(0, batch.length);
     await bulkPersist(jobId, chunk);
+  }
+
+  if (!cancelled) {
+    const finalStatus = await db.query<{ status: string }>(
+      `select status from verification_jobs where id = $1`,
+      [jobId]
+    );
+    cancelled = finalStatus.rows[0]?.status === "cancelled";
+  }
+
+  if (cancelled) {
+    await db.query(
+      `
+        update verification_jobs
+        set status = 'cancelled', completed_at = coalesce(completed_at, now())
+        where id = $1
+          and status = 'cancelled'
+      `,
+      [jobId]
+    );
+
+    logger.info("Verification job stopped after cancellation", {
+      jobId,
+      processed,
+      total: emails.length
+    });
+
+    return { jobId, processed, total: emails.length, cancelled: true };
   }
 
   await db.query(
@@ -322,11 +364,18 @@ export const worker = new Worker<VerificationJobPayload>(
 );
 
 worker.on("completed", job => {
-  console.log(`Job ${job.id} completed`);
+  // console.log(`Job ${job.id} completed`);
+  logger.info("BullMQ job completed", { jobId: job.data.jobId, queueJobId: job.id });
 });
 
 worker.on("failed", (job, error) => {
-  console.error(`Job ${job?.id} failed`, error);
+  // console.error(`Job ${job?.id} failed`, error);
+  logger.error("BullMQ job failed", {
+    jobId: job?.data.jobId,
+    queueJobId: job?.id,
+    error: error.message,
+    attemptsMade: job?.attemptsMade
+  });
   if (!job) return;
 
   const maxAttempts = Number(job.opts.attempts ?? 1);
@@ -361,7 +410,8 @@ worker.on("failed", (job, error) => {
             and status <> 'completed'
         `,
     [error.message, job.data.jobId]
-  ).catch(console.error);
+  // ).catch(console.error);
+  ).catch(error => logger.error("Failed to update job failure state", { error: error instanceof Error ? error.message : String(error) }));
 });
 
 const outboxDispatcher = startOutboxDispatcher();

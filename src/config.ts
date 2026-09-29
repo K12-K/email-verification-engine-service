@@ -50,7 +50,9 @@ const envSchema = z.object({
   RESULT_BATCH_SIZE: z.coerce.number().int().positive().default(100),
   PROGRESS_EVERY: z.coerce.number().int().positive().default(25),
 
-  API_KEY: z.string().min(16)
+  API_KEY: z.string().min(16),
+  API_RATE_LIMIT: z.coerce.number().int().positive().default(60),
+  API_RATE_WINDOW_MS: z.coerce.number().int().positive().default(60000)
 });
 
 export const config = envSchema.parse(process.env);
