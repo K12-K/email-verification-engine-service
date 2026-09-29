@@ -5,7 +5,8 @@ import { randomUUID } from "node:crypto";
 import { config } from "./config.ts";
 import { db } from "./db.ts";
 import { redis } from "./redis.ts";
-import { verificationQueue } from "./queue.ts";
+// import { verificationQueue } from "./queue.ts";
+import { dispatchPendingJobs, startOutboxDispatcher } from "./outbox.ts";
 
 const app = express();
 
@@ -114,51 +115,66 @@ app.post("/v1/jobs", authenticate, async (req, res) => {
       values
     );
 
+    await client.query(
+      `
+        insert into verification_outbox (job_id)
+        values ($1)
+        on conflict (job_id) do nothing
+      `,
+      [jobId]
+    );
+
     await client.query("COMMIT");
 
-    try {
-      await verificationQueue.add(
-        "verify",
-        { jobId },
-        {
-          jobId,
-          attempts: 3,
-          backoff: {
-            type: "exponential",
-            delay: 5000
-          },
-          removeOnComplete: {
-            age: 86400,
-            count: 1000
-          },
-          removeOnFail: {
-            age: 7 * 86400,
-            count: 5000
-          }
-        }
-      );
-    } catch (queueError) {
-      await db.query(
-        `
-          update verification_jobs
-          set status = 'failed',
-              failed_at = now(),
-              error = $1
-          where id = $2
-        `,
-        [
-          queueError instanceof Error
-            ? queueError.message
-            : String(queueError),
-          jobId
-        ]
-      );
+    // try {
+    //   await verificationQueue.add(
+    //     "verify",
+    //     { jobId },
+    //     {
+    //       jobId,
+    //       attempts: 3,
+    //       backoff: {
+    //         type: "exponential",
+    //         delay: 5000
+    //       },
+    //       removeOnComplete: {
+    //         age: 86400,
+    //         count: 1000
+    //       },
+    //       removeOnFail: {
+    //         age: 7 * 86400,
+    //         count: 5000
+    //       }
+    //     }
+    //   );
+    // } catch (queueError) {
+    //   await db.query(
+    //     `
+    //       update verification_jobs
+    //       set status = 'failed',
+    //           failed_at = now(),
+    //           error = $1
+    //       where id = $2
+    //     `,
+    //     [
+    //       queueError instanceof Error
+    //         ? queueError.message
+    //         : String(queueError),
+    //       jobId
+    //     ]
+    //   );
 
-      return res.status(503).json({
-        error: "Job was stored but could not be queued",
-        jobId
-      });
-    }
+    //   return res.status(503).json({
+    //     error: "Job was stored but could not be queued",
+    //     jobId
+    //   });
+    // }
+
+    // Best-effort immediate dispatch. The transactional outbox remains the
+    // recovery path if Redis/BullMQ is temporarily unavailable.
+    void dispatchPendingJobs().catch(error => {
+      console.error("Initial outbox dispatch failed", error);
+    });
 
     return res.status(202).json({
       jobId,
@@ -238,12 +254,27 @@ app.get("/v1/jobs/:id/results", authenticate, async (req, res) => {
     [req.params.id, limit, offset]
   );
 
+  const countResult = await db.query(
+    `
+      select count(*)::int as total
+      from verification_emails
+      where job_id = $1
+    `,
+    [req.params.id]
+  );
+
+  const total = countResult.rows[0]?.total ?? 0;
+
   return res.json({
     page,
     limit,
+    total,
+    totalPages: Math.ceil(total / limit),
     results: result.rows
   });
 });
+
+const outboxDispatcher = startOutboxDispatcher();
 
 const server = app.listen(config.PORT, () => {
   console.log(`API listening on ${config.PORT}`);
@@ -251,6 +282,8 @@ const server = app.listen(config.PORT, () => {
 
 async function shutdown(signal: string) {
   console.log(`Received ${signal}; shutting down API`);
+
+  clearInterval(outboxDispatcher);
 
   server.close(async () => {
     await redis.quit();

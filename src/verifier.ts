@@ -136,7 +136,11 @@ function resultBase(
   };
 }
 
-export async function verifyEmail(email: string): Promise<VerificationResult> {
+// export async function verifyEmail(email: string): Promise<VerificationResult> {
+export async function verifyEmail(
+  email: string,
+  preloadedMx?: MxResult
+): Promise<VerificationResult> {
   const parsed = parseEmail(email);
 
   if (!parsed) {
@@ -163,7 +167,8 @@ export async function verifyEmail(email: string): Promise<VerificationResult> {
     );
   }
 
-  const mx = await resolveMx(parsed.domain);
+  // const mx = await resolveMx(parsed.domain);
+  const mx = preloadedMx ?? await resolveMx(parsed.domain);
 
   if (mx.nullMx || mx.records.length === 0) {
     return resultBase(

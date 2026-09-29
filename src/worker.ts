@@ -3,6 +3,8 @@ import { redis } from "./redis.ts";
 import { config } from "./config.ts";
 import { db } from "./db.ts";
 import { verifyEmail } from "./verifier.ts";
+import { resolveMx } from "./dns.js";
+import { startOutboxDispatcher } from "./outbox.js";
 import type {
   VerificationJobPayload,
   VerificationResult
@@ -140,6 +142,30 @@ async function processJob(job: Job<VerificationJobPayload>) {
   );
 
   const emails = result.rows;
+
+  // Resolve each unique domain once and share the result across all emails
+  // in the job. This is the domain-level optimization required for bulk work.
+  const uniqueDomains = [...new Set(emails.map(row => row.domain).filter(Boolean))];
+  const mxByDomain = new Map<string, Awaited<ReturnType<typeof resolveMx>>>();
+  let domainIndex = 0;
+
+  const dnsLoop = async () => {
+    while (true) {
+      const current = domainIndex++;
+      if (current >= uniqueDomains.length) return;
+
+      const domain = uniqueDomains[current];
+      mxByDomain.set(domain, await resolveMx(domain));
+    }
+  };
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(config.DNS_CONCURRENCY, uniqueDomains.length) },
+      () => dnsLoop()
+    )
+  );
+
   let processed = 0;
 
   const counters = {
@@ -165,7 +191,8 @@ async function processJob(job: Job<VerificationJobPayload>) {
       if (current >= emails.length) return;
 
       const row = emails[current];
-      const verification = await verifyEmail(row.email);
+      // const verification = await verifyEmail(row.email);
+      const verification = await verifyEmail(row.email, mxByDomain.get(row.domain));
       console.log(".......worker.....169.....", verification)
 
       batch.push({
@@ -302,21 +329,46 @@ worker.on("failed", (job, error) => {
   console.error(`Job ${job?.id} failed`, error);
   if (!job) return;
 
+  const maxAttempts = Number(job.opts.attempts ?? 1);
+  const finalAttempt = job.attemptsMade >= maxAttempts;
+
+  // db.query(
+  //   `
+  //     update verification_jobs
+  //     set status = 'failed',
+  //         failed_at = now(),
+  //         error = $1
+  //     where id = $2
+  //       and status <> 'completed'
+  //   `,
+  //   [error.message, job.data.jobId]
+  // ).catch(console.error);
   db.query(
-    `
-      update verification_jobs
-      set status = 'failed',
-          failed_at = now(),
-          error = $1
-      where id = $2
-        and status <> 'completed'
-    `,
+    finalAttempt
+      ? `
+          update verification_jobs
+          set status = 'failed',
+              failed_at = now(),
+              error = $1
+          where id = $2
+            and status <> 'completed'
+        `
+      : `
+          update verification_jobs
+          set status = 'queued',
+              error = $1
+          where id = $2
+            and status <> 'completed'
+        `,
     [error.message, job.data.jobId]
   ).catch(console.error);
 });
 
+const outboxDispatcher = startOutboxDispatcher();
+
 async function shutdown(signal: string) {
   console.log(`Received ${signal}; shutting down worker`);
+  clearInterval(outboxDispatcher);
   await worker.close();
   await redis.quit();
   await db.end();
