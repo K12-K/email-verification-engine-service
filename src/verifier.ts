@@ -1,13 +1,15 @@
-import { getHostname } from "tldts";
-import type {
-  Confidence,
-  VerificationResult
-} from "./types.ts";
 import crypto from "node:crypto";
+import { getHostname } from "tldts";
+import { config } from "./config.ts";
+import { redis } from "./redis.ts";
 import { resolveMx } from "./dns.ts";
 import { smtpVerify } from "./smtp.ts";
-import type { MxResult } from "./types.ts";
-import { config } from "./config.ts";
+import { withRedisLock } from "./throttle.ts";
+import type {
+  Confidence,
+  MxResult,
+  VerificationResult
+} from "./types.ts";
 
 export interface ParsedEmail {
   email: string;
@@ -15,25 +17,15 @@ export interface ParsedEmail {
   domain: string;
 }
 
-export function parseEmail(
-  input: unknown
-): ParsedEmail | null {
-
-  if (typeof input !== "string") {
-    return null;
-  }
+export function parseEmail(input: unknown): ParsedEmail | null {
+  if (typeof input !== "string") return null;
 
   const email = input.trim().toLowerCase();
 
-  if (!email || email.length > 254) {
-    return null;
-  }
+  if (!email || email.length > 254) return null;
 
   const at = email.lastIndexOf("@");
-
-  if (at <= 0 || at === email.length - 1) {
-    return null;
-  }
+  if (at <= 0 || at === email.length - 1) return null;
 
   const localPart = email.slice(0, at);
   const rawDomain = email.slice(at + 1);
@@ -47,10 +39,7 @@ export function parseEmail(
   }
 
   const domain = getHostname(rawDomain);
-
-  if (!domain) {
-    return null;
-  }
+  if (!domain) return null;
 
   return {
     email,
@@ -59,184 +48,232 @@ export function parseEmail(
   };
 }
 
-const catchAllCache = new Map<
-  string,
-  {
-    value: boolean | null;
-    expiresAt: number;
-  }
->();
-
-function randomAddress(domain: string) {
-
-  const token = crypto
-    .randomBytes(18)
-    .toString("hex");
-
+function randomAddress(domain: string): string {
+  const token = crypto.randomBytes(18).toString("hex");
   return `verify-${token}@${domain}`;
+}
+
+function catchAllKey(domain: string): string {
+  return `${config.REDIS_KEY_PREFIX}:catch-all:${domain}`;
 }
 
 export async function detectCatchAll(
   domain: string,
   mx: MxResult
 ): Promise<boolean | null> {
+  if (!config.CATCH_ALL_ENABLED) return null;
+  if (!mx.records.length || mx.nullMx) return false;
 
-  const cached = catchAllCache.get(domain);
+  const key = catchAllKey(domain);
+  const cached = await redis.get(key);
 
-  if (
-    cached &&
-    cached.expiresAt > Date.now()
-  ) {
-    return cached.value;
+  if (cached !== null) {
+    return cached === "1";
   }
 
-  if (!config.CATCH_ALL_ENABLED) {
-    return null;
-  }
+  return withRedisLock(
+    `${key}:lock`,
+    Math.max(10_000, config.SMTP_TIMEOUT_MS * 4),
+    async () => {
+      const again = await redis.get(key);
+      if (again !== null) return again === "1";
 
-  if (!mx.records.length) {
-    return false;
-  }
+      const result = await smtpVerify(
+        mx.records,
+        randomAddress(domain),
+        domain
+      );
 
-  const testEmail = randomAddress(domain);
+      let value: boolean | null = null;
 
-  const result = await smtpVerify(
-    mx.records[0],
-    testEmail
+      if (result.result === "accepted") {
+        value = true;
+      } else if (result.result === "rejected") {
+        value = false;
+      }
+
+      if (value !== null) {
+        await redis.set(
+          key,
+          value ? "1" : "0",
+          "EX",
+          config.CATCH_ALL_CACHE_SECONDS
+        );
+      }
+
+      return value;
+    }
   );
-
-  let value: boolean | null = null;
-
-  if (result.result === "accepted") {
-    value = true;
-  } else if (result.result === "rejected") {
-    value = false;
-  }
-
-  catchAllCache.set(domain, {
-    value,
-    expiresAt: Date.now() + 60 * 60_000
-  });
-
-  return value;
 }
 
-export async function verifyEmail(
-  email: string
-): Promise<VerificationResult> {
+function resultBase(
+  email: string,
+  domain: string,
+  status: VerificationResult["status"],
+  confidence: Confidence,
+  syntax: boolean,
+  mx: boolean,
+  smtp: VerificationResult["smtp"],
+  catchAll: boolean | null,
+  mxHost: string | null,
+  mxPriority: number | null,
+  errorCode: string | null = null,
+  errorMessage: string | null = null
+): VerificationResult {
+  return {
+    email,
+    domain,
+    status,
+    confidence,
+    syntax,
+    mx,
+    smtp,
+    catchAll,
+    mxHost,
+    mxPriority,
+    errorCode,
+    errorMessage
+  };
+}
 
+export async function verifyEmail(email: string): Promise<VerificationResult> {
   const parsed = parseEmail(email);
 
   if (!parsed) {
-
-    return {
-      email,
-      status: "invalid",
-      confidence: "high",
-
-      syntax: false,
-      mx: false,
-
-      smtp: {
+    return resultBase(
+      String(email),
+      "",
+      "invalid",
+      "high",
+      false,
+      false,
+      {
         result: "unknown",
         code: null,
         response: null,
-        host: null
+        host: null,
+        tls: false,
+        attempts: 0
       },
-
-      catchAll: false,
-
-      mxHost: null,
-      mxPriority: null
-    };
+      false,
+      null,
+      null,
+      "INVALID_SYNTAX",
+      "Email address failed normalization/syntax validation"
+    );
   }
 
-  const mx = await resolveMx(
+  const mx = await resolveMx(parsed.domain);
+
+  if (mx.nullMx || mx.records.length === 0) {
+    return resultBase(
+      parsed.email,
+      parsed.domain,
+      "no_mx",
+      "high",
+      true,
+      false,
+      {
+        result: "unknown",
+        code: null,
+        response: null,
+        host: null,
+        tls: false,
+        attempts: 0
+      },
+      false,
+      null,
+      null,
+      mx.errorCode,
+      mx.errorMessage
+    );
+  }
+
+  const smtp = await smtpVerify(
+    mx.records,
+    parsed.email,
     parsed.domain
   );
+  console.log("....verifier, 197,...", mx.records, parsed.email, parsed.domain, smtp)
 
-  if (!mx.records.length) {
-
-    return {
-      email: parsed.email,
-      status: "no_mx",
-      confidence: "high",
-
-      syntax: true,
-      mx: false,
-
-      smtp: {
-        result: "unknown",
-        code: null,
-        response: null,
-        host: null
-      },
-
-      catchAll: false,
-
-      mxHost: null,
-      mxPriority: null
-    };
+  // Only use catch-all classification after an actual recipient
+  // was accepted. A rejected real recipient should remain rejected.
+  let catchAll: boolean | null = null;
+  if (smtp.result === "accepted") {
+    catchAll = await detectCatchAll(parsed.domain, mx);
   }
 
-  const catchAll =
-    await detectCatchAll(
+  if (smtp.result === "rejected") {
+    return resultBase(
+      parsed.email,
       parsed.domain,
-      mx
+      "undeliverable",
+      "high",
+      true,
+      true,
+      smtp,
+      catchAll,
+      smtp.host ?? mx.records[0].exchange,
+      mx.records[0].priority
     );
-
-  const smtp =
-    await smtpVerify(
-      mx.records[0],
-      parsed.email
-    );
-
-  let status:
-    VerificationResult["status"];
-
-  let confidence:
-    VerificationResult["confidence"];
+  }
 
   if (catchAll === true) {
-
-    status = "catch_all";
-    confidence = "high";
-
-  } else if (smtp.result === "rejected") {
-
-    status = "undeliverable";
-    confidence = "high";
-
-  } else if (smtp.result === "accepted") {
-
-    status = "likely_deliverable";
-    confidence = "medium";
-
-  } else if (smtp.result === "temporary") {
-
-    status = "temporary_error";
-    confidence = "low";
-
-  } else {
-
-    status = "unknown";
-    confidence = "low";
+    return resultBase(
+      parsed.email,
+      parsed.domain,
+      "catch_all",
+      "high",
+      true,
+      true,
+      smtp,
+      true,
+      smtp.host ?? mx.records[0].exchange,
+      mx.records[0].priority
+    );
   }
 
-  return {
-    email: parsed.email,
+  if (smtp.result === "accepted") {
+    return resultBase(
+      parsed.email,
+      parsed.domain,
+      "likely_deliverable",
+      "medium",
+      true,
+      true,
+      smtp,
+      false,
+      smtp.host ?? mx.records[0].exchange,
+      mx.records[0].priority
+    );
+  }
 
-    status,
-    confidence,
+  if (smtp.result === "temporary") {
+    return resultBase(
+      parsed.email,
+      parsed.domain,
+      "temporary_error",
+      "low",
+      true,
+      true,
+      smtp,
+      catchAll,
+      smtp.host ?? mx.records[0].exchange,
+      mx.records[0].priority
+    );
+  }
+  console.log("....veridier, 264,...", parsed.email, parsed.domain, smtp)
 
-    syntax: true,
-    mx: true,
-
+  return resultBase(
+    parsed.email,
+    parsed.domain,
+    "unknown",
+    "low",
+    true,
+    true,
     smtp,
-
     catchAll,
-
-    mxHost: mx.records[0].exchange,
-    mxPriority: mx.records[0].priority
-  };
+    smtp.host ?? mx.records[0].exchange,
+    mx.records[0].priority
+  );
 }

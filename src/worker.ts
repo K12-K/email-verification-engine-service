@@ -1,39 +1,137 @@
-import {
-  Worker,
-  Job
-} from "bullmq";
-
+import { Worker, Job } from "bullmq";
 import { redis } from "./redis.ts";
 import { config } from "./config.ts";
 import { db } from "./db.ts";
 import { verifyEmail } from "./verifier.ts";
 import type {
-  VerificationJobPayload
+  VerificationJobPayload,
+  VerificationResult
 } from "./types.ts";
 
-async function processJob(
-  job: Job<VerificationJobPayload>
-) {
+type EmailRow = {
+  id: string;
+  email: string;
+  normalized_email: string;
+  domain: string;
+};
 
-  const { jobId } = job.data;
+const countersFor = (result: VerificationResult) => ({
+  deliverable:
+    result.status === "likely_deliverable" ||
+    result.status === "deliverable"
+      ? 1 : 0,
+  undeliverable: result.status === "undeliverable" ? 1 : 0,
+  catch_all: result.status === "catch_all" ? 1 : 0,
+  no_mx: result.status === "no_mx" ? 1 : 0,
+  invalid: result.status === "invalid" ? 1 : 0,
+  unknown: result.status === "unknown" ? 1 : 0,
+  temporary_error:
+    result.status === "temporary_error" ? 1 : 0
+});
+
+async function bulkPersist(
+  jobId: string,
+  rows: Array<{ emailId: string; result: VerificationResult }>
+): Promise<void> {
+  if (!rows.length) return;
+
+  const values: unknown[] = [];
+  const placeholders: string[] = [];
+
+  rows.forEach((row, index) => {
+    const base = index * 15;
+
+    placeholders.push(
+      `($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5},` +
+      `$${base + 6},$${base + 7},$${base + 8},$${base + 9},$${base + 10},` +
+      `$${base + 11},$${base + 12},$${base + 13},$${base + 14},$${base + 15})`
+    );
+
+    values.push(
+      row.emailId,
+      row.result.status,
+      row.result.confidence,
+      row.result.syntax,
+      row.result.mx,
+      row.result.smtp.result,
+      row.result.smtp.code,
+      row.result.smtp.response,
+      row.result.catchAll,
+      row.result.mxHost,
+      row.result.mxPriority,
+      row.result.errorCode,
+      row.result.errorMessage,
+      row.result.smtp.tls,
+      row.result.smtp.attempts
+    );
+  });
 
   await db.query(
     `
+      insert into verification_results (
+        email_id,
+        status,
+        confidence,
+        syntax_result,
+        mx_result,
+        smtp_result,
+        smtp_code,
+        smtp_response,
+        catch_all_result,
+        mx_host,
+        mx_priority,
+        error_code,
+        error_message,
+        smtp_tls,
+        smtp_attempts
+      )
+      values ${placeholders.join(",")}
+      on conflict (email_id)
+      do update set
+        status = excluded.status,
+        confidence = excluded.confidence,
+        syntax_result = excluded.syntax_result,
+        mx_result = excluded.mx_result,
+        smtp_result = excluded.smtp_result,
+        smtp_code = excluded.smtp_code,
+        smtp_response = excluded.smtp_response,
+        catch_all_result = excluded.catch_all_result,
+        mx_host = excluded.mx_host,
+        mx_priority = excluded.mx_priority,
+        error_code = excluded.error_code,
+        error_message = excluded.error_message,
+        smtp_tls = excluded.smtp_tls,
+        smtp_attempts = excluded.smtp_attempts,
+        verified_at = now()
+    `,
+    values
+  );
+}
+
+async function processJob(job: Job<VerificationJobPayload>) {
+  const { jobId } = job.data;
+
+  // Idempotency guard: completed jobs are never re-run accidentally.
+  const started = await db.query(
+    `
       update verification_jobs
       set status = 'processing',
-          started_at = now()
+          started_at = coalesce(started_at, now()),
+          error = null
       where id = $1
+        and status in ('queued', 'processing', 'failed')
+      returning id
     `,
     [jobId]
   );
 
-  const result = await db.query(
+  if (!started.rowCount) {
+    return { jobId, skipped: true };
+  }
+
+  const result = await db.query<EmailRow>(
     `
-      select
-        id,
-        email,
-        normalized_email,
-        domain
+      select id, email, normalized_email, domain
       from verification_emails
       where job_id = $1
       order by id
@@ -42,7 +140,6 @@ async function processJob(
   );
 
   const emails = result.rows;
-
   let processed = 0;
 
   const counters = {
@@ -55,129 +152,54 @@ async function processJob(
     temporary_error: 0
   };
 
-  /*
-   * Conservative SMTP concurrency.
-   */
-  const concurrency =
-    config.SMTP_CONCURRENCY;
+  const batch: Array<{
+    emailId: string;
+    result: VerificationResult;
+  }> = [];
 
   let index = 0;
 
-  async function workerLoop() {
-
+  const workerLoop = async () => {
     while (true) {
-
       const current = index++;
-
-      if (current >= emails.length) {
-        return;
-      }
+      if (current >= emails.length) return;
 
       const row = emails[current];
+      const verification = await verifyEmail(row.email);
+      console.log(".......worker.....169.....", verification)
 
-      const result =
-        await verifyEmail(row.email);
+      batch.push({
+        emailId: row.id,
+        result: verification
+      });
 
-      await db.query(
-        `
-          insert into verification_results (
-            email_id,
-            status,
-            confidence,
-            syntax_result,
-            mx_result,
-            smtp_result,
-            smtp_code,
-            smtp_response,
-            catch_all_result,
-            mx_host,
-            mx_priority
-          )
-          values (
-            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11
-          )
-          on conflict (email_id)
-          do update set
-            status = excluded.status,
-            confidence = excluded.confidence,
-            syntax_result = excluded.syntax_result,
-            mx_result = excluded.mx_result,
-            smtp_result = excluded.smtp_result,
-            smtp_code = excluded.smtp_code,
-            smtp_response = excluded.smtp_response,
-            catch_all_result = excluded.catch_all_result,
-            mx_host = excluded.mx_host,
-            mx_priority = excluded.mx_priority,
-            verified_at = now()
-        `,
-        [
-          row.id,
-          result.status,
-          result.confidence,
-          result.syntax,
-          result.mx,
-          result.smtp.result,
-          result.smtp.code,
-          result.smtp.response,
-          result.catchAll,
-          result.mxHost,
-          result.mxPriority
-        ]
-      );
+      const c = countersFor(verification);
+      counters.deliverable += c.deliverable;
+      counters.undeliverable += c.undeliverable;
+      counters.catch_all += c.catch_all;
+      counters.no_mx += c.no_mx;
+      counters.invalid += c.invalid;
+      counters.unknown += c.unknown;
+      counters.temporary_error += c.temporary_error;
 
       processed++;
 
       if (
-        result.status ===
-        "likely_deliverable"
-      ) {
-        counters.deliverable++;
-      } else if (
-        result.status ===
-        "undeliverable"
-      ) {
-        counters.undeliverable++;
-      } else if (
-        result.status ===
-        "catch_all"
-      ) {
-        counters.catch_all++;
-      } else if (
-        result.status ===
-        "no_mx"
-      ) {
-        counters.no_mx++;
-      } else if (
-        result.status ===
-        "invalid"
-      ) {
-        counters.invalid++;
-      } else if (
-        result.status ===
-        "temporary_error"
-      ) {
-        counters.temporary_error++;
-      } else {
-        counters.unknown++;
-      }
-
-      /*
-       * Don't write progress for every email.
-       * This reduces database/Redis traffic.
-       */
-      if (
-        processed % 10 === 0 ||
+        batch.length >= config.RESULT_BATCH_SIZE ||
         processed === emails.length
       ) {
+        const chunk = batch.splice(0, batch.length);
+        await bulkPersist(jobId, chunk);
+      }
 
+      if (
+        processed % config.PROGRESS_EVERY === 0 ||
+        processed === emails.length
+      ) {
         const percentage =
           emails.length === 0
             ? 100
-            : Math.round(
-                processed /
-                emails.length *
-                100
-              );
+            : Math.round((processed / emails.length) * 100);
 
         await job.updateProgress({
           processed,
@@ -213,19 +235,19 @@ async function processJob(
         );
       }
     }
-  }
+  };
 
   await Promise.all(
     Array.from(
-      {
-        length: Math.min(
-          concurrency,
-          emails.length
-        )
-      },
+      { length: Math.min(config.SMTP_CONCURRENCY, emails.length) },
       () => workerLoop()
     )
   );
+
+  if (batch.length) {
+    const chunk = batch.splice(0, batch.length);
+    await bulkPersist(jobId, chunk);
+  }
 
   await db.query(
     `
@@ -263,53 +285,45 @@ async function processJob(
   };
 }
 
-export const worker =
-  new Worker<VerificationJobPayload>(
-    config.QUEUE_NAME,
-    processJob,
-    {
-      connection: redis,
-      concurrency: 1
-    }
-  );
-
-worker.on(
-  "completed",
-  job => {
-    console.log(
-      `Job ${job.id} completed`
-    );
+export const worker = new Worker<VerificationJobPayload>(
+  config.QUEUE_NAME,
+  processJob,
+  {
+    connection: redis,
+    concurrency: 1
   }
 );
 
-worker.on(
-  "failed",
-  (job, error) => {
+worker.on("completed", job => {
+  console.log(`Job ${job.id} completed`);
+});
 
-    console.error(
-      `Job ${job?.id} failed`,
-      error
-    );
+worker.on("failed", (job, error) => {
+  console.error(`Job ${job?.id} failed`, error);
+  if (!job) return;
 
-    if (job) {
-      db.query(
-        `
-          update verification_jobs
-          set
-            status = 'failed',
-            failed_at = now(),
-            error = $1
-          where id = $2
-        `,
-        [
-          error.message,
-          job.data.jobId
-        ]
-      ).catch(console.error);
-    }
-  }
-);
+  db.query(
+    `
+      update verification_jobs
+      set status = 'failed',
+          failed_at = now(),
+          error = $1
+      where id = $2
+        and status <> 'completed'
+    `,
+    [error.message, job.data.jobId]
+  ).catch(console.error);
+});
 
-console.log(
-  "Email verification worker started"
-);
+async function shutdown(signal: string) {
+  console.log(`Received ${signal}; shutting down worker`);
+  await worker.close();
+  await redis.quit();
+  await db.end();
+  process.exit(0);
+}
+
+process.once("SIGTERM", () => void shutdown("SIGTERM"));
+process.once("SIGINT", () => void shutdown("SIGINT"));
+
+console.log("Email verification worker started");

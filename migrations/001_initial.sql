@@ -30,7 +30,6 @@ create index verification_jobs_status_idx
 create index verification_jobs_created_at_idx
     on verification_jobs(created_at desc);
 
-
 create table verification_emails (
     id uuid primary key default gen_random_uuid(),
 
@@ -53,7 +52,6 @@ create index verification_emails_domain_idx
 
 create unique index verification_emails_job_email_idx
     on verification_emails(job_id, normalized_email);
-
 
 create table verification_results (
     id uuid primary key default gen_random_uuid(),
