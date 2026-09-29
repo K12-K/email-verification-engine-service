@@ -1,6 +1,6 @@
 import express from "express";
 import { z } from "zod";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 
 import { config } from "./config.ts";
 import { db } from "./db.ts";
@@ -78,8 +78,14 @@ app.get("/health", async (_req, res) => {
 });
 
 const createJobSchema = z.object({
-  emails: z.array(z.string()).min(1).max(config.MAX_EMAILS_PER_JOB)
+  emails: z.array(z.string()).min(1).max(config.MAX_EMAILS_PER_JOB),
+  clientReferenceId: z.string().trim().min(1).max(128).optional()
 });
+
+function requestHash(emails: string[], clientReferenceId?: string): string {
+  const payload = JSON.stringify({ emails, clientReferenceId: clientReferenceId ?? null });
+  return createHash("sha256").update(payload).digest("hex");
+}
 
 // app.post("/v1/jobs", authenticate, async (req, res) => {
 app.post("/v1/jobs", authenticate, rateLimit, async (req, res) => {
@@ -109,19 +115,120 @@ app.post("/v1/jobs", authenticate, rateLimit, async (req, res) => {
     });
   }
 
+  const idempotencyKey = req.header("idempotency-key")?.trim() || null;
+  if (idempotencyKey && (idempotencyKey.length < 8 || idempotencyKey.length > 255)) {
+    return res.status(400).json({
+      error: "Invalid Idempotency-Key",
+      message: "Idempotency-Key must contain 8 to 255 characters.",
+      requestId
+    });
+  }
+
+  const clientReferenceId = parsed.data.clientReferenceId ?? null;
+  const hash = requestHash(emails, clientReferenceId ?? undefined);
   const client = await db.connect();
 
   try {
     await client.query("BEGIN");
 
+    // const jobResult = await client.query(
+    //   `
+    //     insert into verification_jobs (total)
+    //     values ($1)
+    //     returning id
+    //   `,
+    //   [emails.length]
+    // );
+
+    if (idempotencyKey) {
+      const existing = await client.query(
+        `
+          select id, total, status, request_hash
+          from verification_jobs
+          where idempotency_key = $1
+          for update
+        `,
+        [idempotencyKey]
+      );
+
+      if (existing.rowCount) {
+        const row = existing.rows[0];
+
+        if (row.request_hash !== hash) {
+          await client.query("ROLLBACK");
+          return res.status(409).json({
+            error: "Idempotency key already used with a different request",
+            jobId: row.id,
+            requestId
+          });
+        }
+
+        await client.query("COMMIT");
+
+        logger.info("Returning existing idempotent verification job", {
+          requestId,
+          jobId: row.id,
+          total: row.total
+        });
+
+        return res.status(202).json({
+          jobId: row.id,
+          total: row.total,
+          status: row.status,
+          idempotent: true,
+          requestId
+        });
+      }
+    }
+
     const jobResult = await client.query(
       `
-        insert into verification_jobs (total)
-        values ($1)
-        returning id
+        insert into verification_jobs (
+          total,
+          idempotency_key,
+          request_hash,
+          client_reference_id
+        )
+        values ($1, $2, $3, $4)
+        on conflict (idempotency_key) where idempotency_key is not null do nothing
+        returning id, total, status
       `,
-      [emails.length]
+      [emails.length, idempotencyKey, hash, clientReferenceId]
     );
+
+    if (!jobResult.rowCount) {
+      const existing = await client.query(
+        `
+          select id, total, status, request_hash
+          from verification_jobs
+          where idempotency_key = $1
+        `,
+        [idempotencyKey]
+      );
+
+      if (!existing.rowCount) {
+        throw new Error("Idempotency conflict could not be resolved");
+      }
+
+      const row = existing.rows[0];
+      if (row.request_hash !== hash) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          error: "Idempotency key already used with a different request",
+          jobId: row.id,
+          requestId
+        });
+      }
+
+      await client.query("COMMIT");
+      return res.status(202).json({
+        jobId: row.id,
+        total: row.total,
+        status: row.status,
+        idempotent: true,
+        requestId
+      });
+    }
 
     const jobId = jobResult.rows[0].id;
 
@@ -171,7 +278,8 @@ app.post("/v1/jobs", authenticate, rateLimit, async (req, res) => {
     logger.info("Verification job created", {
       requestId,
       jobId,
-      total: emails.length
+      total: emails.length,
+      clientReferenceId
     });
 
     // try {
@@ -233,6 +341,7 @@ app.post("/v1/jobs", authenticate, rateLimit, async (req, res) => {
       jobId,
       total: emails.length,
       status: "queued",
+      idempotent: false,
       // requestId: randomUUID(),
       requestId
     });
