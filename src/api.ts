@@ -365,6 +365,15 @@ app.post("/v1/jobs", authenticate, rateLimit, async (req, res) => {
   } catch (error) {
     await client.query("ROLLBACK");
     // console.error(error);
+
+    const pgError = error as { code?: string; constraint?: string };
+    if (pgError.code === "23505" && pgError.constraint === "verification_jobs_client_reference_unique_idx") {
+      return res.status(409).json({
+        error: "clientReferenceId is already associated with another job",
+        requestId
+      });
+    }
+
     logger.error("Failed to create job", {
       requestId,
       error: error instanceof Error ? error.message : String(error)
@@ -410,6 +419,82 @@ app.get("/v1/jobs/:id", authenticate, rateLimit, async (req, res) => {
 
   if (!result.rowCount) {
     return res.status(404).json({ error: "Job not found", requestId });
+  }
+
+  const row = result.rows[0];
+  const total = Number(row.total) || 0;
+  const processed = Number(row.processed) || 0;
+
+  return res.json({
+    jobId: row.id,
+    status: row.status,
+    total,
+    processed,
+    progressPercent: total > 0 ? Math.min(100, Math.floor((processed / total) * 100)) : 0,
+    counts: {
+      deliverable: row.deliverable,
+      undeliverable: row.undeliverable,
+      catchAll: row.catch_all,
+      noMx: row.no_mx,
+      invalid: row.invalid,
+      unknown: row.unknown,
+      temporaryError: row.temporary_error
+    },
+    createdAt: row.created_at,
+    startedAt: row.started_at,
+    completedAt: row.completed_at,
+    failedAt: row.failed_at,
+    error: row.error,
+    clientReferenceId: row.client_reference_id,
+    requestId
+  });
+});
+
+app.get("/v1/jobs/by-reference/:clientReferenceId", authenticate, rateLimit, async (req, res) => {
+  const requestId = res.locals.requestId as string;
+  const clientReferenceId = req.params.clientReferenceId?.trim();
+
+  if (!clientReferenceId) {
+    return res.status(400).json({ error: "clientReferenceId is required", requestId });
+  }
+
+  const result = await db.query(
+    `
+      select
+        id,
+        status,
+        total,
+        processed,
+        deliverable,
+        undeliverable,
+        catch_all,
+        no_mx,
+        invalid,
+        unknown,
+        temporary_error,
+        created_at,
+        started_at,
+        completed_at,
+        failed_at,
+        error,
+        client_reference_id
+      from verification_jobs
+      where client_reference_id = $1
+      order by created_at desc
+      limit 2
+    `,
+    [clientReferenceId]
+  );
+
+  if (!result.rowCount) {
+    return res.status(404).json({ error: "Job not found", requestId });
+  }
+
+  if (result.rowCount > 1) {
+    return res.status(409).json({
+      error: "Multiple jobs found for clientReferenceId",
+      requestId
+    });
   }
 
   const row = result.rows[0];

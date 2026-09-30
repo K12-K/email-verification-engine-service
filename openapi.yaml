@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Email Verification Engine API
-  version: 1.5.0
+  version: 1.6.0
   description: Internal asynchronous email verification service API.
 servers:
   - url: http://localhost:8080
@@ -46,6 +46,24 @@ paths:
         '400': { description: Invalid request }
         '409': { description: Idempotency conflict }
         '429': { description: Rate limited }
+  /v1/jobs/by-reference/{clientReferenceId}:
+    get:
+      summary: Find a job by the application client reference ID
+      description: Used by the application to reconcile a create request when the engine response was lost.
+      parameters:
+        - in: path
+          name: clientReferenceId
+          required: true
+          schema: { type: string, maxLength: 128 }
+      responses:
+        '200':
+          description: Job found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobStatusResponse'
+        '404': { description: Job not found }
+        '409': { description: Multiple jobs found for reference }
   /v1/jobs/{id}:
     get:
       summary: Get job status and progress
