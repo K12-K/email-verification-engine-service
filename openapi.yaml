@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Email Verification Engine API
-  version: 1.4.0
+  version: 1.5.0
   description: Internal asynchronous email verification service API.
 servers:
   - url: http://localhost:8080
@@ -52,7 +52,12 @@ paths:
       parameters:
         - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
       responses:
-        '200': { description: Job status }
+        '200':
+          description: Stable job status and progress response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobStatusResponse'
         '404': { description: Job not found }
   /v1/jobs/{id}/results:
     get:
@@ -61,8 +66,14 @@ paths:
         - { in: path, name: id, required: true, schema: { type: string, format: uuid } }
         - { in: query, name: page, schema: { type: integer, minimum: 1, default: 1 } }
         - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { in: query, name: status, schema: { type: string, enum: [invalid, no_mx, undeliverable, likely_deliverable, deliverable, catch_all, temporary_error, unknown] } }
       responses:
-        '200': { description: Paginated results }
+        '200':
+          description: Paginated results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultsResponse'
         '404': { description: Job not found }
   /v1/jobs/{id}/cancel:
     post:
@@ -74,6 +85,46 @@ paths:
         '404': { description: Job not found }
         '409': { description: Job cannot be cancelled }
 components:
+  schemas:
+    JobStatusResponse:
+      type: object
+      required: [jobId, status, total, processed, progressPercent, counts, requestId]
+      properties:
+        jobId: { type: string, format: uuid }
+        status: { type: string, enum: [queued, processing, completed, failed, cancelled] }
+        total: { type: integer }
+        processed: { type: integer }
+        progressPercent: { type: integer, minimum: 0, maximum: 100 }
+        counts:
+          type: object
+          properties:
+            deliverable: { type: integer }
+            undeliverable: { type: integer }
+            catchAll: { type: integer }
+            noMx: { type: integer }
+            invalid: { type: integer }
+            unknown: { type: integer }
+            temporaryError: { type: integer }
+        createdAt: { type: string, format: date-time }
+        startedAt: { type: string, format: date-time, nullable: true }
+        completedAt: { type: string, format: date-time, nullable: true }
+        failedAt: { type: string, format: date-time, nullable: true }
+        error: { type: string, nullable: true }
+        clientReferenceId: { type: string, nullable: true }
+        requestId: { type: string, format: uuid }
+    ResultsResponse:
+      type: object
+      properties:
+        jobId: { type: string, format: uuid }
+        page: { type: integer }
+        limit: { type: integer }
+        total: { type: integer }
+        totalPages: { type: integer }
+        status: { type: string, nullable: true }
+        results:
+          type: array
+          items: { type: object }
+        requestId: { type: string, format: uuid }
   securitySchemes:
     bearerAuth:
       type: http

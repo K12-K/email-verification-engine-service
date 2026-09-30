@@ -82,8 +82,15 @@ const createJobSchema = z.object({
   clientReferenceId: z.string().trim().min(1).max(128).optional()
 });
 
+function canonicalizeEmails(emails: string[]): string[] {
+  return [...new Set(emails.map(email => email.trim().toLowerCase()).filter(Boolean))].sort();
+}
+
 function requestHash(emails: string[], clientReferenceId?: string): string {
-  const payload = JSON.stringify({ emails, clientReferenceId: clientReferenceId ?? null });
+  const payload = JSON.stringify({
+    emails: canonicalizeEmails(emails),
+    clientReferenceId: clientReferenceId?.trim() || null
+  });
   return createHash("sha256").update(payload).digest("hex");
 }
 
@@ -100,13 +107,23 @@ app.post("/v1/jobs", authenticate, rateLimit, async (req, res) => {
     });
   }
 
-  const emails = [
-    ...new Set(
-      parsed.data.emails
-        .map(email => email.trim())
-        .filter(Boolean)
-    )
-  ];
+  // const emails = [
+  //   ...new Set(
+  //     parsed.data.emails
+  //       .map(email => email.trim())
+  //       .filter(Boolean)
+  //   )
+  // ];
+  const emails: string[] = [];
+  const seenEmails = new Set<string>();
+
+  for (const rawEmail of parsed.data.emails) {
+    const email = rawEmail.trim();
+    const normalized = email.toLowerCase();
+    if (!email || seenEmails.has(normalized)) continue;
+    seenEmails.add(normalized);
+    emails.push(email);
+  }
 
   if (!emails.length) {
     return res.status(400).json({
@@ -364,9 +381,27 @@ app.post("/v1/jobs", authenticate, rateLimit, async (req, res) => {
 
 // app.get("/v1/jobs/:id", authenticate, async (req, res) => {
 app.get("/v1/jobs/:id", authenticate, rateLimit, async (req, res) => {
-    const result = await db.query(
+  const requestId = res.locals.requestId as string;
+  const result = await db.query(
     `
-      select *
+      select
+        id,
+        status,
+        total,
+        processed,
+        deliverable,
+        undeliverable,
+        catch_all,
+        no_mx,
+        invalid,
+        unknown,
+        temporary_error,
+        created_at,
+        started_at,
+        completed_at,
+        failed_at,
+        error,
+        client_reference_id
       from verification_jobs
       where id = $1
     `,
@@ -374,13 +409,36 @@ app.get("/v1/jobs/:id", authenticate, rateLimit, async (req, res) => {
   );
 
   if (!result.rowCount) {
-    return res.status(404).json({
-      error: "Job not found",
-      requestId: res.locals.requestId
-    });
+    return res.status(404).json({ error: "Job not found", requestId });
   }
 
-  return res.json(result.rows[0]);
+  const row = result.rows[0];
+  const total = Number(row.total) || 0;
+  const processed = Number(row.processed) || 0;
+
+  return res.json({
+    jobId: row.id,
+    status: row.status,
+    total,
+    processed,
+    progressPercent: total > 0 ? Math.min(100, Math.floor((processed / total) * 100)) : 0,
+    counts: {
+      deliverable: row.deliverable,
+      undeliverable: row.undeliverable,
+      catchAll: row.catch_all,
+      noMx: row.no_mx,
+      invalid: row.invalid,
+      unknown: row.unknown,
+      temporaryError: row.temporary_error
+    },
+    createdAt: row.created_at,
+    startedAt: row.started_at,
+    completedAt: row.completed_at,
+    failedAt: row.failed_at,
+    error: row.error,
+    clientReferenceId: row.client_reference_id,
+    requestId
+  });
 });
 
 app.post("/v1/jobs/:id/cancel", authenticate, rateLimit, async (req, res) => {
@@ -438,8 +496,20 @@ app.post("/v1/jobs/:id/cancel", authenticate, rateLimit, async (req, res) => {
   });
 });
 
+const resultStatuses = [
+  "invalid",
+  "no_mx",
+  "undeliverable",
+  "likely_deliverable",
+  "deliverable",
+  "catch_all",
+  "temporary_error",
+  "unknown"
+] as const;
+
 // app.get("/v1/jobs/:id/results", authenticate, async (req, res) => {
 app.get("/v1/jobs/:id/results", authenticate, rateLimit, async (req, res) => {
+  const requestId = res.locals.requestId as string;
   // const page = Math.max(1, Number(req.query.page || 1));
   // const limit = Math.min(
   //   100,
@@ -447,14 +517,66 @@ app.get("/v1/jobs/:id/results", authenticate, rateLimit, async (req, res) => {
   // );
   const pageValue = Number(req.query.page || 1);
   const limitValue = Number(req.query.limit || 50);
+  const status = typeof req.query.status === "string" ? req.query.status : undefined;
 
   const page = Number.isFinite(pageValue) ? Math.max(1, Math.floor(pageValue)) : 1;
   const limit = Number.isFinite(limitValue)
     ? Math.min(100, Math.max(1, Math.floor(limitValue)))
     : 50;
 
-  const offset = (page - 1) * limit;
+  if (status && !resultStatuses.includes(status as typeof resultStatuses[number])) {
+    return res.status(400).json({
+      error: "Invalid result status",
+      allowed: resultStatuses,
+      requestId
+    });
+  }
 
+  const jobExists = await db.query(
+    `select id from verification_jobs where id = $1`,
+    [req.params.id]
+  );
+
+  if (!jobExists.rowCount) {
+    return res.status(404).json({ error: "Job not found", requestId });
+  }
+
+  const offset = (page - 1) * limit;
+  const statusFilter = status ? `and r.status = $4` : "";
+  const params: unknown[] = [req.params.id, limit, offset];
+  if (status) params.push(status);
+
+  // const result = await db.query(
+  //   `
+  //     select
+  //       e.id,
+  //       e.email,
+  //       e.domain,
+  //       r.status,
+  //       r.confidence,
+  //       r.syntax_result,
+  //       r.mx_result,
+  //       r.smtp_result,
+  //       r.smtp_code,
+  //       r.smtp_response,
+  //       r.catch_all_result,
+  //       r.mx_host,
+  //       r.mx_priority,
+  //       r.error_code,
+  //       r.error_message,
+  //       r.smtp_tls,
+  //       r.smtp_attempts,
+  //       r.verified_at
+  //     from verification_emails e
+  //     left join verification_results r
+  //       on r.email_id = e.id
+  //     where e.job_id = $1
+  //     order by e.id
+  //     limit $2
+  //     offset $3
+  //   `,
+  //   [req.params.id, limit, offset]
+  // );
   const result = await db.query(
     `
       select
@@ -477,34 +599,47 @@ app.get("/v1/jobs/:id/results", authenticate, rateLimit, async (req, res) => {
         r.smtp_attempts,
         r.verified_at
       from verification_emails e
-      left join verification_results r
-        on r.email_id = e.id
+      left join verification_results r on r.email_id = e.id
       where e.job_id = $1
+        ${statusFilter}
       order by e.id
-      limit $2
-      offset $3
+      limit $2 offset $3
     `,
-    [req.params.id, limit, offset]
+    params
   );
 
+  const countParams: unknown[] = [req.params.id];
+  if (status) countParams.push(status);
+  // const countResult = await db.query(
+  //   `
+  //     select count(*)::int as total
+  //     from verification_emails
+  //     where job_id = $1
+  //   `,
+  //   [req.params.id]
+  // );
   const countResult = await db.query(
     `
       select count(*)::int as total
-      from verification_emails
-      where job_id = $1
+      from verification_emails e
+      left join verification_results r on r.email_id = e.id
+      where e.job_id = $1
+        ${status ? "and r.status = $2" : ""}
     `,
-    [req.params.id]
+    countParams
   );
 
   const total = countResult.rows[0]?.total ?? 0;
 
   return res.json({
+    jobId: req.params.id,
     page,
     limit,
     total,
     totalPages: Math.ceil(total / limit),
+    status: status ?? null,
     results: result.rows,
-    requestId: res.locals.requestId
+    requestId
   });
 });
 
