@@ -17,6 +17,16 @@ export interface ParsedEmail {
   domain: string;
 }
 
+const CONSUMER_EMAIL_DOMAINS = new Set([
+  "gmail.com",
+  "googlemail.com",
+  "outlook.com",
+  "hotmail.com",
+  "live.com",
+  "yahoo.com",
+  "icloud.com"
+]);
+
 export function parseEmail(input: unknown): ParsedEmail | null {
   if (typeof input !== "string") return null;
 
@@ -62,6 +72,9 @@ export async function detectCatchAll(
   mx: MxResult
 ): Promise<boolean | null> {
   if (!config.CATCH_ALL_ENABLED) return null;
+  // SMTP recipient acceptance is not reliable proof of catch-all
+  // behavior for these consumer email providers.
+  if (CONSUMER_EMAIL_DOMAINS.has(domain.toLowerCase())) return null;
   if (!mx.records.length || mx.nullMx) return false;
 
   const key = catchAllKey(domain);
@@ -247,7 +260,8 @@ export async function verifyEmail(
       true,
       true,
       smtp,
-      false,
+      // false,
+      catchAll,
       smtp.host ?? mx.records[0].exchange,
       mx.records[0].priority
     );
