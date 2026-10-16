@@ -8,6 +8,7 @@
     "dev:api": "tsx src/api.ts",
     "dev:worker": "tsx src/worker.ts",
     "dev": "concurrently \"npm:dev:api\" \"npm:dev:worker\"",
+    "start": "concurrently \"npm:start:api\" \"npm:start:worker\"",
     "build": "tsc",
     "start:api": "node dist/api.js",
     "start:worker": "node dist/worker.js"
