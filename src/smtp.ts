@@ -51,31 +51,48 @@ async function attempt(
   try {
     await client.connect({ timeout: config.SMTP_TIMEOUT_MS });
 
-    await client.greet({
-      hostname: config.SMTP_EHLO,
-      timeout: config.SMTP_TIMEOUT_MS
-    });
+    // await client.greet({
+    //   hostname: config.SMTP_EHLO,
+    //   timeout: config.SMTP_TIMEOUT_MS
+    // });
 
-    let tls = client.isSecure();
+    // let tls = client.isSecure();
+    let tls = false;
 
+    // if (
+    //   config.SMTP_USE_STARTTLS &&
+    //   !tls &&
+    //   client.hasExtension("STARTTLS")
+    // ) {
+    //   await client.secure({
+    //     timeout: config.SMTP_TIMEOUT_MS
+    //   });
+
+    //   // STARTTLS resets SMTP's extension state; EHLO must be sent again.
+    //   await client.ehlo({
+    //     hostname: config.SMTP_EHLO,
+    //     timeout: config.SMTP_TIMEOUT_MS
+    //   });
+
+    //   tls = client.isSecure();
+    // }
     if (
       config.SMTP_USE_STARTTLS &&
       !tls &&
-      client.hasExtension("STARTTLS")
+      client.hasExtension(["STARTTLS"])
     ) {
       await client.secure({
         timeout: config.SMTP_TIMEOUT_MS
       });
-
-      // STARTTLS resets SMTP's extension state; EHLO must be sent again.
-      await client.ehlo({
+    
+      await client.greet({
         hostname: config.SMTP_EHLO,
         timeout: config.SMTP_TIMEOUT_MS
       });
-
-      tls = client.isSecure();
+    
+      tls = true;
     }
-
+    
     if (config.SMTP_REQUIRE_STARTTLS && !tls) {
       return {
         result: "unknown",
@@ -128,7 +145,9 @@ async function attempt(
       code,
       response: parseResponse(error),
       host: mx.exchange,
-      tls: client.isSecure(),
+      // tls: client.isSecure(),
+      // tls,
+      tls: false,
       attempts: 1
     };
   } finally {

@@ -452,7 +452,9 @@ app.get("/v1/jobs/:id", authenticate, rateLimit, async (req, res) => {
 
 app.get("/v1/jobs/by-reference/:clientReferenceId", authenticate, rateLimit, async (req, res) => {
   const requestId = res.locals.requestId as string;
-  const clientReferenceId = req.params.clientReferenceId?.trim();
+  // const clientReferenceId = req.params.clientReferenceId?.trim();
+  const rawReferenceId = req.params.clientReferenceId;
+  const clientReferenceId = typeof rawReferenceId === "string" ? rawReferenceId.trim() : "";
 
   if (!clientReferenceId) {
     return res.status(400).json({ error: "clientReferenceId is required", requestId });

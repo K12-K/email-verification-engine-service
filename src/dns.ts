@@ -32,6 +32,10 @@ interface MxData {
   exchange: string;
 }
 
+interface DecodedSoaData {
+  minimum?: number;
+}
+
 interface DnsRecord {
   name: string;
   type: string;
@@ -49,7 +53,7 @@ interface DecodedDns {
     name: string;
     type: string;
     ttl?: number;
-    data?: unknown;
+    data?: DecodedSoaData | Record<string, unknown>;
   }>;
 }
 
@@ -132,7 +136,7 @@ function queryTcp(server: string, packet: Buffer): Promise<Buffer> {
 
     socket.once("error", error => finish(error));
 
-    socket.on("data", chunk => {
+    socket.on("data", (chunk: Buffer) => {
       buffer = Buffer.concat([buffer, chunk]);
 
       if (expectedLength === null && buffer.length >= 2) {
