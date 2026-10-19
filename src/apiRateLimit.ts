@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { redis } from "./redis.js";
-import { config } from "./config.js";
+import { redis } from "./redis.ts";
+import { config } from "./config.ts";
 
 const INCREMENT_SCRIPT = `
 local current = redis.call('INCR', KEYS[1])

@@ -223,20 +223,38 @@ function negativeTtl(authorities: DecodedDns["authorities"]): number | null {
   return Math.min(soa.ttl, minimum);
 }
 
+// function clampPositiveTtl(ttl: number | null): number {
+//   const source = ttl ?? config.DNS_CACHE_MIN_TTL_SECONDS;
+//   return Math.max(
+//     config.DNS_CACHE_MIN_TTL_SECONDS,
+//     Math.min(source, config.DNS_CACHE_MAX_TTL_SECONDS)
+//   );
+// }
 function clampPositiveTtl(ttl: number | null): number {
+  // If the resolver did not include a TTL, use a conservative fallback. When
+  // an authoritative TTL exists, never extend it to an arbitrary minimum.
   const source = ttl ?? config.DNS_CACHE_MIN_TTL_SECONDS;
-  return Math.max(
-    config.DNS_CACHE_MIN_TTL_SECONDS,
-    Math.min(source, config.DNS_CACHE_MAX_TTL_SECONDS)
-  );
+  return Math.min(source, config.DNS_CACHE_MAX_TTL_SECONDS);
 }
 
 function clampNegativeTtl(ttl: number | null): number {
   const source = ttl ?? 60;
-  return Math.max(
-    1,
-    Math.min(source, config.DNS_NEGATIVE_CACHE_MAX_TTL_SECONDS)
-  );
+  // return Math.max(
+  //   1,
+  //   Math.min(source, config.DNS_NEGATIVE_CACHE_MAX_TTL_SECONDS)
+  // );
+  return Math.min(source, config.DNS_NEGATIVE_CACHE_MAX_TTL_SECONDS);
+}
+
+async function cacheDnsResult(key: string, result: MxResult, ttl: number): Promise<void> {
+  // TTL 0 explicitly means do not cache. Redis is an acceleration layer; a
+  // cache write failure must not turn a successful DNS answer into an error.
+  if (ttl <= 0) return;
+  try {
+    await redis.set(key, JSON.stringify(result), "EX", ttl);
+  } catch {
+    // Continue with the live DNS answer when Redis is temporarily unavailable.
+  }
 }
 
 function cacheKey(domain: string): string {
@@ -265,10 +283,17 @@ function isMxRecord(
 
 export async function resolveMx(domain: string): Promise<MxResult> {
   const key = cacheKey(domain);
-  const cached = await redis.get(key);
+  // const cached = await redis.get(key);
 
-  if (cached) {
-    return JSON.parse(cached) as MxResult;
+  // if (cached) {
+  //   return JSON.parse(cached) as MxResult;
+  // }
+  try {
+    const cached = await redis.get(key);
+    if (cached) return JSON.parse(cached) as MxResult;
+  } catch {
+    // PostgreSQL remains the durable result store; DNS can still be queried
+    // directly if the Redis cache is unavailable.
   }
 
   try {
@@ -288,12 +313,13 @@ export async function resolveMx(domain: string): Promise<MxResult> {
         errorMessage: "Domain does not exist"
       };
 
-      await redis.set(
-        key,
-        JSON.stringify(result),
-        "EX",
-        clampNegativeTtl(negativeTtl(response.authorities))
-      );
+      // await redis.set(
+      //   key,
+      //   JSON.stringify(result),
+      //   "EX",
+      //   clampNegativeTtl(negativeTtl(response.authorities))
+      // );
+      await cacheDnsResult(key, result, clampNegativeTtl(negativeTtl(response.authorities)));
 
       return result;
     }
@@ -310,12 +336,13 @@ export async function resolveMx(domain: string): Promise<MxResult> {
         errorMessage: `DNS resolver returned RCODE ${code}`
       };
 
-      await redis.set(
-        key,
-        JSON.stringify(result),
-        "EX",
-        30
-      );
+      // await redis.set(
+      //   key,
+      //   JSON.stringify(result),
+      //   "EX",
+      //   30
+      // );
+      await cacheDnsResult(key, result, 30);
 
       return result;
     }
@@ -343,14 +370,14 @@ export async function resolveMx(domain: string): Promise<MxResult> {
     const mxAnswers = (answers ?? []).filter(isMxRecord);
 
     const ttl = positiveTtl(mxAnswers);
-    
+
     const records: MxRecord[] = mxAnswers
       .map(record => ({
         exchange: record.data.exchange
           .replace(/\.$/, "")
           .toLowerCase(),
     
-        priority: Number(record.data.preference),
+        priority: Number(record.data.preference ?? 0),
     
         ttl: Number(
           record.ttl ??
@@ -359,7 +386,7 @@ export async function resolveMx(domain: string): Promise<MxResult> {
         )
       }))
       .sort((a, b) => a.priority - b.priority);
-        
+
     const nullMx = records.length === 1 && records[0].exchange === ".";
 
     if (nullMx) {
@@ -374,12 +401,13 @@ export async function resolveMx(domain: string): Promise<MxResult> {
         errorMessage: "Domain explicitly publishes Null MX"
       };
 
-      await redis.set(
-        key,
-        JSON.stringify(result),
-        "EX",
-        clampPositiveTtl(ttl)
-      );
+      // await redis.set(
+      //   key,
+      //   JSON.stringify(result),
+      //   "EX",
+      //   clampPositiveTtl(ttl)
+      // );
+      await cacheDnsResult(key, result, clampPositiveTtl(ttl));
 
       return result;
     }
@@ -396,12 +424,13 @@ export async function resolveMx(domain: string): Promise<MxResult> {
         errorMessage: null
       };
 
-      await redis.set(
-        key,
-        JSON.stringify(result),
-        "EX",
-        clampPositiveTtl(ttl)
-      );
+      // await redis.set(
+      //   key,
+      //   JSON.stringify(result),
+      //   "EX",
+      //   clampPositiveTtl(ttl)
+      // );
+      await cacheDnsResult(key, result, clampPositiveTtl(ttl));
 
       return result;
     }
@@ -438,12 +467,13 @@ export async function resolveMx(domain: string): Promise<MxResult> {
         errorMessage: null
       };
 
-      await redis.set(
-        key,
-        JSON.stringify(result),
-        "EX",
-        clampPositiveTtl(implicitTtl)
-      );
+      // await redis.set(
+      //   key,
+      //   JSON.stringify(result),
+      //   "EX",
+      //   clampPositiveTtl(implicitTtl)
+      // );
+      await cacheDnsResult(key, result, clampPositiveTtl(implicitTtl));
 
       return result;
     }
@@ -459,12 +489,13 @@ export async function resolveMx(domain: string): Promise<MxResult> {
       errorMessage: "No MX, A, or AAAA record was found"
     };
 
-    await redis.set(
-      key,
-      JSON.stringify(result),
-      "EX",
-      clampNegativeTtl(negativeTtl(response.authorities))
-    );
+    // await redis.set(
+    //   key,
+    //   JSON.stringify(result),
+    //   "EX",
+    //   clampNegativeTtl(negativeTtl(response.authorities))
+    // );
+    await cacheDnsResult(key, result, clampNegativeTtl(negativeTtl(response.authorities)));
 
     return result;
   } catch (error) {
@@ -484,7 +515,8 @@ export async function resolveMx(domain: string): Promise<MxResult> {
       errorMessage: message
     };
 
-    await redis.set(key, JSON.stringify(result), "EX", 15);
+    // await redis.set(key, JSON.stringify(result), "EX", 15);
+    await cacheDnsResult(key, result, 15);
     return result;
   }
 }

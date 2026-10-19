@@ -24,6 +24,17 @@ const envSchema = z.object({
   DNS_CACHE_MAX_TTL_SECONDS: z.coerce.number().int().positive().default(86400),
   DNS_NEGATIVE_CACHE_MAX_TTL_SECONDS: z.coerce.number().int().positive().default(300),
 
+  // Result cache freshness is independent of the DNS/MX TTL. Redis is the
+  // short-lived accelerator; PostgreSQL stores evidence until retention expiry.
+  EMAIL_CACHE_HMAC_SECRET: z.string().min(32).optional(),
+  EMAIL_RESULT_TTL_SECONDS: z.coerce.number().int().positive().default(604800),
+  EMAIL_CATCH_ALL_TTL_SECONDS: z.coerce.number().int().positive().default(86400),
+  EMAIL_INCONCLUSIVE_TTL_SECONDS: z.coerce.number().int().positive().default(3600),
+  EMAIL_TEMPORARY_COOLDOWN_SECONDS: z.coerce.number().int().positive().default(600),
+  EMAIL_RESULT_REDIS_TTL_SECONDS: z.coerce.number().int().positive().default(86400),
+  EMAIL_RESULT_RETENTION_DAYS: z.coerce.number().int().positive().default(90),
+  EMAIL_RESULT_LOCK_TTL_MS: z.coerce.number().int().positive().default(180000),
+
   SMTP_FROM: z.string().email(),
   SMTP_EHLO: z.string().min(1),
   SMTP_USE_STARTTLS: z
@@ -45,7 +56,7 @@ const envSchema = z.object({
     .string()
     .default("true")
     .transform(v => v.toLowerCase() === "true"),
-  CATCH_ALL_CACHE_SECONDS: z.coerce.number().int().positive().default(3600),
+  CATCH_ALL_CACHE_SECONDS: z.coerce.number().int().positive().default(86400),
 
   RESULT_BATCH_SIZE: z.coerce.number().int().positive().default(100),
   PROGRESS_EVERY: z.coerce.number().int().positive().default(25),

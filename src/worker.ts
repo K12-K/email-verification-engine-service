@@ -2,7 +2,8 @@ import { Worker, Job } from "bullmq";
 import { redis } from "./redis.ts";
 import { config } from "./config.ts";
 import { db } from "./db.ts";
-import { verifyEmail } from "./verifier.ts";
+// import { verifyEmail } from "./verifier.ts";
+import { verifyEmailWithCache, getFreshCachedResult, type EmailResultCacheEntry } from "./resultCache.ts";
 import { resolveMx } from "./dns.ts";
 import { startOutboxDispatcher } from "./outbox.ts";
 import { logger } from "./logger.ts";
@@ -34,7 +35,7 @@ const countersFor = (result: VerificationResult) => ({
 
 async function bulkPersist(
   jobId: string,
-  rows: Array<{ emailId: string; result: VerificationResult }>
+  rows: Array<{ emailId: string; result: VerificationResult; cacheEntry: EmailResultCacheEntry }>
 ): Promise<void> {
   if (!rows.length) return;
 
@@ -42,12 +43,12 @@ async function bulkPersist(
   const placeholders: string[] = [];
 
   rows.forEach((row, index) => {
-    const base = index * 15;
+    const base = index * 16;
 
     placeholders.push(
       `($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5},` +
       `$${base + 6},$${base + 7},$${base + 8},$${base + 9},$${base + 10},` +
-      `$${base + 11},$${base + 12},$${base + 13},$${base + 14},$${base + 15})`
+      `$${base + 11},$${base + 12},$${base + 13},$${base + 14},$${base + 15},$${base + 16})`
     );
 
     values.push(
@@ -65,7 +66,8 @@ async function bulkPersist(
       row.result.errorCode,
       row.result.errorMessage,
       row.result.smtp.tls,
-      row.result.smtp.attempts
+      row.result.smtp.attempts,
+      row.cacheEntry.checkedAt
     );
   });
 
@@ -86,7 +88,8 @@ async function bulkPersist(
         error_code,
         error_message,
         smtp_tls,
-        smtp_attempts
+        smtp_attempts,
+        verified_at
       )
       values ${placeholders.join(",")}
       on conflict (email_id)
@@ -105,9 +108,53 @@ async function bulkPersist(
         error_message = excluded.error_message,
         smtp_tls = excluded.smtp_tls,
         smtp_attempts = excluded.smtp_attempts,
-        verified_at = now()
+        verified_at = excluded.verified_at
     `,
     values
+  );
+
+  // Upsert the cross-job cache in batches with the per-job result write. Cache
+  // hits keep their original checked_at/expires_at and therefore never extend
+  // freshness just because a user requested the same email again.
+  const cacheValues: unknown[] = [];
+  const cachePlaceholders: string[] = [];
+  rows.forEach((row, index) => {
+    const base = index * 8;
+    cachePlaceholders.push(
+      `($${base + 1},$${base + 2},$${base + 3},$${base + 4},$${base + 5},$${base + 6},$${base + 7},$${base + 8}::jsonb)`
+    );
+    const entry = row.cacheEntry;
+    cacheValues.push(
+      entry.emailHash,
+      entry.normalizedEmail,
+      entry.domain,
+      entry.result.status,
+      entry.checkedAt,
+      entry.expiresAt,
+      entry.retentionUntil,
+      JSON.stringify(entry.result)
+    );
+  });
+
+  await db.query(
+    `
+      insert into email_verification_cache (
+        email_hash, normalized_email, domain, status, checked_at,
+        expires_at, retention_until, result
+      )
+      values ${cachePlaceholders.join(",")}
+      on conflict (email_hash) do update set
+        normalized_email = excluded.normalized_email,
+        domain = excluded.domain,
+        status = excluded.status,
+        checked_at = excluded.checked_at,
+        expires_at = excluded.expires_at,
+        retention_until = excluded.retention_until,
+        result = excluded.result,
+        updated_at = now()
+      where excluded.checked_at > email_verification_cache.checked_at
+    `,
+    cacheValues
   );
 }
 
@@ -144,9 +191,29 @@ async function processJob(job: Job<VerificationJobPayload>) {
 
   const emails = result.rows;
 
-  // Resolve each unique domain once and share the result across all emails
-  // in the job. This is the domain-level optimization required for bulk work.
-  const uniqueDomains = [...new Set(emails.map(row => row.domain).filter(Boolean))];
+
+  // Check the email-result cache before doing domain work. Only cache misses
+  // participate in MX prefetch; domains are still resolved once per job and
+  // their independent DNS TTL is enforced by the engine's DNS cache.
+  const cachedByEmailId = new Map<string, EmailResultCacheEntry | null>();
+  let cacheIndex = 0;
+  const cacheLookupLoop = async () => {
+    while (true) {
+      const current = cacheIndex++;
+      if (current >= emails.length) return;
+      const row = emails[current];
+      cachedByEmailId.set(row.id, await getFreshCachedResult(row.email));
+    }
+  };
+  await Promise.all(
+    Array.from(
+      { length: Math.min(10, config.DNS_CONCURRENCY, emails.length) },
+      () => cacheLookupLoop()
+    )
+  );
+
+  const missingRows = emails.filter(row => !cachedByEmailId.get(row.id));
+  const uniqueDomains = [...new Set(missingRows.map(row => row.domain).filter(Boolean))];
   const mxByDomain = new Map<string, Awaited<ReturnType<typeof resolveMx>>>();
   let domainIndex = 0;
 
@@ -183,6 +250,7 @@ async function processJob(job: Job<VerificationJobPayload>) {
   const batch: Array<{
     emailId: string;
     result: VerificationResult;
+    cacheEntry: EmailResultCacheEntry;
   }> = [];
 
   let index = 0;
@@ -196,12 +264,15 @@ async function processJob(job: Job<VerificationJobPayload>) {
 
       const row = emails[current];
       // const verification = await verifyEmail(row.email);
-      const verification = await verifyEmail(row.email, mxByDomain.get(row.domain));
+      // const verification = await verifyEmail(row.email, mxByDomain.get(row.domain));
+      const cacheEntry = cachedByEmailId.get(row.id) ?? await verifyEmailWithCache(row.email, mxByDomain.get(row.domain));
+      const verification = cacheEntry.result;
       console.log(".......worker.....169.....", verification)
 
       batch.push({
         emailId: row.id,
-        result: verification
+        result: verification,
+        cacheEntry
       });
 
       const c = countersFor(verification);
@@ -354,6 +425,17 @@ async function processJob(job: Job<VerificationJobPayload>) {
   };
 }
 
+const resultCacheCleanup = setInterval(() => {
+  db.query(`delete from email_verification_cache where retention_until < now()`)
+    .then(result => {
+      if (result.rowCount) logger.info("Expired email result cache rows removed", { count: result.rowCount });
+    })
+    .catch(error => logger.warn("Email result cache cleanup failed", {
+      error: error instanceof Error ? error.message : String(error)
+    }));
+}, 6 * 60 * 60 * 1000);
+resultCacheCleanup.unref();
+
 export const worker = new Worker<VerificationJobPayload>(
   config.QUEUE_NAME,
   processJob,
@@ -419,6 +501,7 @@ const outboxDispatcher = startOutboxDispatcher();
 async function shutdown(signal: string) {
   console.log(`Received ${signal}; shutting down worker`);
   clearInterval(outboxDispatcher);
+  clearInterval(resultCacheCleanup);
   await worker.close();
   await redis.quit();
   await db.end();
