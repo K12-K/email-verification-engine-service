@@ -51,10 +51,10 @@ async function attempt(
   try {
     await client.connect({ timeout: config.SMTP_TIMEOUT_MS });
 
-    // await client.greet({
-    //   hostname: config.SMTP_EHLO,
-    //   timeout: config.SMTP_TIMEOUT_MS
-    // });
+    await client.greet({
+      hostname: config.SMTP_EHLO,
+      timeout: config.SMTP_TIMEOUT_MS
+    });
 
     // let tls = client.isSecure();
     let tls = false;
